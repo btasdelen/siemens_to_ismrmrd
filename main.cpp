@@ -43,6 +43,7 @@ using boost::locale::conv::utf_to_utf;
 #include <fstream>
 #include <sstream>
 #include <streambuf>
+#include <cstring>
 #include <utility>
 #include <typeinfo>
 
@@ -828,11 +829,6 @@ int main(int argc, char* argv[]) {
         {
             int nxVersion = atoi(software_version.substr(11).c_str());
             std::cerr << "Detected Numaris/X version: " << nxVersion << std::endl;
-            if (nxVersion > 30)
-            {
-                skip_syncdata = true;
-                std::cerr << "Disabling parsing of syncdata due to incompatibility!" << std::endl;
-            }
         }
 
         std::cerr << "Dwell time: " << dwell_time_0 << std::endl;
@@ -1365,6 +1361,21 @@ void makeWaveformHeader(ISMRMRD::IsmrmrdHeader &header) {
 
 }
 
+size_t ensureXaWaveformHeader(ISMRMRD::IsmrmrdHeader &header, uint32_t waveform_type) {
+    auto waveform_name = std::string("PMU") + std::to_string(waveform_type);
+    for (size_t i = 0; i < header.waveformInformation.size(); i++) {
+        if (header.waveformInformation[i].waveformName == waveform_name) {
+            return i;
+        }
+    }
+
+    ISMRMRD::WaveformInformation info;
+    info.waveformName = waveform_name;
+    info.waveformType = ISMRMRD::WaveformType::OTHER;
+    header.waveformInformation.push_back(info);
+    return header.waveformInformation.size() - 1;
+}
+
 const std::map<PMU_Type, int> waveformId = {{PMU_Type::ECG1, 0},
                                             {PMU_Type::ECG2, 0},
                                             {PMU_Type::ECG3, 0},
@@ -1398,121 +1409,232 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
         return std::vector<ISMRMRD::Waveform>();
     } else {
         len = dma_length - sizeof(sScanHeader);
-        size_t target_offset = current_offset + len;
+        std::vector<char> payload(len);
+        siemens_dat.read(payload.data(), payload.size());
+        current_offset += payload.size();
 
-        uint32_t packetSize;
-        siemens_dat.read((char *) &packetSize, sizeof(uint32_t));
-        current_offset += sizeof(uint32_t);
-        std::string packedID;
-        {
-            char packedIDArr[52];
-            siemens_dat.read(packedIDArr, 52);
-            current_offset += 52;
-            packedID = packedIDArr;
+        auto extract_string = [&payload](size_t offset, size_t length) {
+            auto available = std::min(length, payload.size() - std::min(offset, payload.size()));
+            if (available == 0) return std::string();
+            auto string_len = strnlen(payload.data() + offset, available);
+            return std::string(payload.data() + offset, string_len);
+        };
+
+        auto read_u32 = [&payload](size_t &offset, uint32_t &value) {
+            if (offset + sizeof(uint32_t) > payload.size()) return false;
+            memcpy(&value, payload.data() + offset, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            return true;
+        };
+
+        if (payload.size() < sizeof(uint32_t) + 52) {
+            throw std::runtime_error("Malformed syncdata packet");
         }
 
-        if ((skip_syncdata) || (packedID.find("PMU") == packedID.npos)) { //packedID indicates this isn't PMU data, so let's jump ship.
-            auto skip = target_offset - current_offset;
-            if (!skipBytes(siemens_dat, skip, current_offset)) {
-                std::cerr << "WARNING: Failed to skip PMU data section" << std::endl;
-            }
+        std::string packedID = extract_string(sizeof(uint32_t), 52);
+        if ((skip_syncdata) || (packedID.find("PMU") == packedID.npos)) {
             return std::vector<ISMRMRD::Waveform>();
         }
 
         bool learning_phase = packedID.find("PMULearnPhase") != packedID.npos;
-
-        uint32_t swappedFlag, timestamp0, timestamp, packerNr, duration;
-
-        siemens_dat.read((char *) &swappedFlag, sizeof(uint32_t));
-        siemens_dat.read((char *) &timestamp0, sizeof(uint32_t));
-        siemens_dat.read((char *) &timestamp, sizeof(uint32_t));
-        siemens_dat.read((char *) &packerNr, sizeof(uint32_t));
-        siemens_dat.read((char *) &duration, sizeof(uint32_t));
-        current_offset += 5 * sizeof(uint32_t);
-
-        PMU_Type magic;
-        siemens_dat.read((char *) &magic, sizeof(uint32_t));
-        current_offset += sizeof(uint32_t);
-
-        //Read in all the PMU data first, to figure out if we have multiple ECGs.
-        std::map<PMU_Type, std::tuple<std::vector<PMUdata>, uint32_t >> pmu_map;
-        std::set<PMU_Type> ecg_types = {PMU_Type::ECG1, PMU_Type::ECG2, PMU_Type::ECG3, PMU_Type::ECG4};
-        std::map<PMU_Type, std::tuple<std::vector<PMUdata>, uint32_t >> ecg_map;
-        while (magic != PMU_Type::END) {
-            //Read and store period
-            uint32_t period;
-
-            siemens_dat.read((char *) &period, sizeof(uint32_t));
-            current_offset += sizeof(uint32_t);
-
-            //Allocate and read data
-            std::vector<PMUdata> data(duration / period);
-            siemens_dat.read((char *) data.data(), data.size() * sizeof(PMUdata));
-            current_offset += data.size() * sizeof(PMUdata);
-
-            //Split into ECG and PMU sets.
-            if (ecg_types.count(magic)) {
-                ecg_map[magic] = std::make_tuple(std::move(data), period);
-            } else {
-                pmu_map[magic] = std::make_tuple(std::move(data), period);
-            }
-            //Read next tag
-            siemens_dat.read((char *) &magic, sizeof(uint32_t));
-            current_offset += sizeof(uint32_t);
-
-            if (!PMU_Types.count(magic))
-                throw std::runtime_error("Malformed file");
-        }
-
-        //Have to handle ECG separately.
-
         std::vector<ISMRMRD::Waveform> waveforms;
         waveforms.reserve(5);
-        if (ecg_map.size() > 0 || pmu_map.size() > 0) {
 
-            if (ecg_map.size() > 0) {
+        uint32_t timestamp = 0;
+        uint32_t duration = 0;
 
+        auto parse_legacy = [&]() {
+            size_t offset = sizeof(uint32_t) + 52;
+            uint32_t swappedFlag, timestamp0, packerNr;
+            PMU_Type magic;
+
+            if (!read_u32(offset, swappedFlag) || !read_u32(offset, timestamp0) || !read_u32(offset, timestamp)
+                || !read_u32(offset, packerNr) || !read_u32(offset, duration)) {
+                return false;
+            }
+
+            uint32_t raw_magic;
+            if (!read_u32(offset, raw_magic)) {
+                return false;
+            }
+            magic = static_cast<PMU_Type>(raw_magic);
+            if (!PMU_Types.count(magic)) {
+                return false;
+            }
+
+            std::map<PMU_Type, std::tuple<std::vector<PMUdata>, uint32_t >> pmu_map;
+            std::set<PMU_Type> ecg_types = {PMU_Type::ECG1, PMU_Type::ECG2, PMU_Type::ECG3, PMU_Type::ECG4};
+            std::map<PMU_Type, std::tuple<std::vector<PMUdata>, uint32_t >> ecg_map;
+            while (magic != PMU_Type::END) {
+                uint32_t period;
+                if (!read_u32(offset, period) || period == 0 || duration % period) {
+                    throw std::runtime_error("Malformed PMU data");
+                }
+
+                std::vector<PMUdata> data(duration / period);
+                auto bytes = data.size() * sizeof(PMUdata);
+                if (offset + bytes > payload.size()) {
+                    throw std::runtime_error("Malformed PMU data");
+                }
+                memcpy(data.data(), payload.data() + offset, bytes);
+                offset += bytes;
+
+                if (ecg_types.count(magic)) {
+                    ecg_map[magic] = std::make_tuple(std::move(data), period);
+                } else {
+                    pmu_map[magic] = std::make_tuple(std::move(data), period);
+                }
+
+                if (!read_u32(offset, raw_magic)) {
+                    throw std::runtime_error("Malformed PMU data");
+                }
+                magic = static_cast<PMU_Type>(raw_magic);
+                if (!PMU_Types.count(magic)) {
+                    throw std::runtime_error("Malformed PMU data");
+                }
+            }
+
+            if (ecg_map.size() > 0 || pmu_map.size() > 0) {
+                if (ecg_map.size() > 0) {
+                    size_t channels = ecg_map.size();
+                    size_t number_of_elements = std::get<0>(ecg_map.begin()->second).size();
+
+                    auto ecg_waveform = ISMRMRD::Waveform(number_of_elements, channels + 1);
+                    ecg_waveform.head.waveform_id = waveformId.at(PMU_Type::ECG1) + 5 * learning_phase;
+
+                    uint32_t *ecg_waveform_data = ecg_waveform.data;
+                    uint32_t *trigger_data = ecg_waveform_data + number_of_elements * channels;
+                    std::fill(trigger_data, trigger_data + number_of_elements, 0);
+                    for (auto key_val : ecg_map) {
+                        auto tup = unpack_pmu(std::get<0>(key_val.second));
+                        auto &data = std::get<0>(tup);
+                        auto &trigger = std::get<1>(tup);
+
+                        std::copy(data.begin(), data.end(), ecg_waveform_data);
+                        ecg_waveform_data += data.size();
+
+                        for (auto i = 0; i < number_of_elements; i++) {
+                            trigger_data[i] |= trigger[i];
+                        }
+                    }
+                    waveforms.push_back(std::move(ecg_waveform));
+                }
+
+                for (auto key_val : pmu_map) {
+                    auto tup = unpack_pmu(std::get<0>(key_val.second));
+                    auto &data = std::get<0>(tup);
+                    auto &trigger = std::get<1>(tup);
+
+                    auto waveform = ISMRMRD::Waveform(data.size(), 2);
+                    waveform.head.waveform_id = waveformId.at(key_val.first) + 5 * learning_phase;
+                    std::copy(data.begin(), data.end(), waveform.data);
+                    std::copy(trigger.begin(), trigger.end(), waveform.data + data.size());
+                    waveforms.push_back(std::move(waveform));
+                }
+            }
+            return true;
+        };
+
+        auto parse_xa = [&]() {
+            if (payload.size() < sizeof(uint32_t) + 60 + 3 * sizeof(uint32_t)) {
+                return false;
+            }
+
+            packedID = extract_string(sizeof(uint32_t), 60);
+            learning_phase = packedID.find("PMULearnPhase") != packedID.npos;
+
+            size_t offset = sizeof(uint32_t) + 60;
+            uint32_t timestamp0, encoded_duration;
+            if (!read_u32(offset, timestamp0) || !read_u32(offset, timestamp) || !read_u32(offset, encoded_duration)) {
+                return false;
+            }
+
+            duration = encoded_duration & 0xFFFF;
+            if (duration == 0) {
+                duration = encoded_duration;
+            }
+            if (duration == 0) {
+                return false;
+            }
+
+            std::map<uint32_t, std::vector<uint32_t>> ecg_map;
+            std::map<uint32_t, std::vector<uint32_t>> known_map;
+            std::map<uint32_t, std::vector<uint32_t>> unknown_map;
+
+            while (offset + 2 * sizeof(uint32_t) <= payload.size()) {
+                uint32_t raw_magic, period;
+                if (!read_u32(offset, raw_magic)) {
+                    break;
+                }
+                if (raw_magic == 0xFFFFFFFF) {
+                    break;
+                }
+                if (!read_u32(offset, period) || period == 0 || duration % period) {
+                    return false;
+                }
+
+                size_t samples = duration / period;
+                auto bytes = samples * sizeof(uint32_t);
+                if (offset + bytes > payload.size()) {
+                    return false;
+                }
+
+                std::vector<uint32_t> data(samples);
+                memcpy(data.data(), payload.data() + offset, bytes);
+                offset += bytes;
+
+                if (raw_magic >= 1 && raw_magic <= 4) {
+                    ecg_map[raw_magic] = std::move(data);
+                } else if (raw_magic >= 5 && raw_magic <= 8) {
+                    known_map[raw_magic] = std::move(data);
+                } else {
+                    unknown_map[raw_magic] = std::move(data);
+                }
+            }
+
+            if (ecg_map.empty() && known_map.empty() && unknown_map.empty()) {
+                return false;
+            }
+
+            makeWaveformHeader(header);
+
+            if (!ecg_map.empty()) {
                 size_t channels = ecg_map.size();
-                size_t number_of_elements = std::get<0>(ecg_map.begin()->second).size();
+                size_t number_of_elements = ecg_map.begin()->second.size();
 
                 auto ecg_waveform = ISMRMRD::Waveform(number_of_elements, channels + 1);
                 ecg_waveform.head.waveform_id = waveformId.at(PMU_Type::ECG1) + 5 * learning_phase;
 
                 uint32_t *ecg_waveform_data = ecg_waveform.data;
-
                 uint32_t *trigger_data = ecg_waveform_data + number_of_elements * channels;
                 std::fill(trigger_data, trigger_data + number_of_elements, 0);
-                //Copy in the data
-                for (auto key_val : ecg_map) {
-                    auto tup = unpack_pmu(std::get<0>(key_val.second));
-                    auto &data = std::get<0>(tup);
-                    auto &trigger = std::get<1>(tup);
-
-                    std::copy(data.begin(), data.end(), ecg_waveform_data);
-                    ecg_waveform_data += data.size();
-
-                    for (auto i = 0; i < number_of_elements; i++) {
-                        trigger_data[i] |= trigger[i];
-                    }
+                for (auto &key_val : ecg_map) {
+                    std::copy(key_val.second.begin(), key_val.second.end(), ecg_waveform_data);
+                    ecg_waveform_data += key_val.second.size();
                 }
-
-//                ecg_waveform.head.sample_time_us = sample_time_us.at(PMU_Type::ECG1);
                 waveforms.push_back(std::move(ecg_waveform));
             }
 
-            for (auto key_val : pmu_map) {
-                auto tup = unpack_pmu(std::get<0>(key_val.second));
-                auto &data = std::get<0>(tup);
-                auto &trigger = std::get<1>(tup);
-
-                auto waveform = ISMRMRD::Waveform(data.size(), 2);
-                waveform.head.waveform_id = waveformId.at(key_val.first) + 5 * learning_phase;
-                std::copy(data.begin(), data.end(), waveform.data);
-                std::copy(trigger.begin(), trigger.end(), waveform.data + data.size());
-//                waveform.head.sample_time_us = sample_time_us.at(key_val.first);
+            for (auto &key_val : known_map) {
+                auto waveform = ISMRMRD::Waveform(key_val.second.size(), 2);
+                waveform.head.waveform_id = key_val.first - 4 + 5 * learning_phase;
+                std::copy(key_val.second.begin(), key_val.second.end(), waveform.data);
+                std::fill(waveform.data + key_val.second.size(), waveform.data + 2 * key_val.second.size(), 0);
                 waveforms.push_back(std::move(waveform));
             }
-            //Figure out number of ECG channels
+
+            for (auto &key_val : unknown_map) {
+                auto waveform = ISMRMRD::Waveform(key_val.second.size(), 1);
+                waveform.head.waveform_id = ensureXaWaveformHeader(header, key_val.first);
+                std::copy(key_val.second.begin(), key_val.second.end(), waveform.data);
+                waveforms.push_back(std::move(waveform));
+            }
+
+            return true;
+        };
+
+        if (!parse_legacy() && !parse_xa()) {
+            throw std::runtime_error("Malformed PMU data");
         }
 
         for (auto &waveform : waveforms) {
@@ -1522,11 +1644,8 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
             waveform.head.sample_time_us = double(duration * 100) / waveform.head.number_of_samples;
         }
 
-        if (waveforms.size()) makeWaveformHeader(header); //Add the header if needed
-
-        auto skip = target_offset - current_offset;
-        if (!skipBytes(siemens_dat, skip, current_offset)) {
-            std::cerr << "WARNING: Failed to skip to end of waveform data" << std::endl;
+        if (waveforms.size() && header.waveformInformation.empty()) {
+            makeWaveformHeader(header);
         }
         return waveforms;
     }
