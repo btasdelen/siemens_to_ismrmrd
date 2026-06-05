@@ -78,7 +78,7 @@ void calc_traj(double* xgrad, double* ygrad, int ngrad, int Nints, double Tgsamp
 
 std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFILE, unsigned long acquisitions,
                                             uint32_t dma_length, sScanHeader scanheader, ISMRMRD::IsmrmrdHeader &header,
-                                            long scan_counter, bool skip_syncdata, bool isNX, size_t& current_offset);
+                                            long scan_counter, bool skip_syncdata, bool isNX, bool isXa50, size_t& current_offset);
 
 std::string select_file(const std::string &, const std::string &, bool, unsigned int);
 std::string get_file_content(const std::string &file);
@@ -820,6 +820,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Protocol name: " << protocol_name << std::endl;
 
         bool isNX = false;
+        int nxVersion = 0;
         if ((baseLineString.find("NXVA") != std::string::npos) || (software_version.find("syngo MR XA") != std::string::npos) )
         {
             isNX = true;
@@ -827,7 +828,7 @@ int main(int argc, char* argv[]) {
 
         if (isNX)
         {
-            int nxVersion = atoi(software_version.substr(11).c_str());
+            nxVersion = atoi(software_version.substr(11).c_str());
             std::cerr << "Detected Numaris/X version: " << nxVersion << std::endl;
         }
 
@@ -947,7 +948,7 @@ int main(int argc, char* argv[]) {
                 uint32_t last_scan_counter = acquisitions - 1;
 
                 auto waveforms = readSyncdata(siemens_dat, VBFILE, acquisitions, dma_length, scanhead, header,
-                                            last_scan_counter, skip_syncdata, isNX, current_offset);
+                                            last_scan_counter, skip_syncdata, isNX, nxVersion == 50, current_offset);
                 for (auto &w : waveforms) {
                     serializer.serialize(w);
                 }
@@ -1361,8 +1362,8 @@ void makeWaveformHeader(ISMRMRD::IsmrmrdHeader &header) {
 
 }
 
-size_t ensureXaWaveformHeader(ISMRMRD::IsmrmrdHeader &header, uint32_t waveform_type) {
-    auto waveform_name = std::string("PMU") + std::to_string(waveform_type);
+size_t ensureXaWaveformHeader(ISMRMRD::IsmrmrdHeader &header, const std::string &waveform_name,
+                              ISMRMRD::WaveformType waveform_type, bool has_trigger_channel) {
     for (size_t i = 0; i < header.waveformInformation.size(); i++) {
         if (header.waveformInformation[i].waveformName == waveform_name) {
             return i;
@@ -1371,7 +1372,14 @@ size_t ensureXaWaveformHeader(ISMRMRD::IsmrmrdHeader &header, uint32_t waveform_
 
     ISMRMRD::WaveformInformation info;
     info.waveformName = waveform_name;
-    info.waveformType = ISMRMRD::WaveformType::OTHER;
+    info.waveformType = waveform_type;
+    if (has_trigger_channel) {
+        ISMRMRD::UserParameterLong userParam;
+        userParam.name = "TriggerChannel";
+        userParam.value = 1;
+        info.userParameters = ISMRMRD::UserParameters();
+        info.userParameters.get().userParameterLong.push_back(userParam);
+    }
     header.waveformInformation.push_back(info);
     return header.waveformInformation.size() - 1;
 }
@@ -1397,7 +1405,8 @@ std::set<PMU_Type> PMU_Types = {PMU_Type::ECG1, PMU_Type::ECG2, PMU_Type::ECG3, 
 
 std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFILE, unsigned long acquisitions,
                                             uint32_t dma_length, sScanHeader scanheader, ISMRMRD::IsmrmrdHeader &header,
-                                            long last_scan_counter, bool skip_syncdata, bool isNX, size_t& current_offset) {
+                                            long last_scan_counter, bool skip_syncdata, bool isNX, bool isXa50,
+                                            size_t& current_offset) {
 
     size_t len = 0;
     if (VBFILE) {
@@ -1661,6 +1670,93 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
         };
 
         auto parse_xa = [&]() {
+            struct XaWaveformDescriptor {
+                bool is_ecg = false;
+                uint32_t ecg_channel = 0;
+                bool uses_standard_header = false;
+                PMU_Type standard_type = PMU_Type::END;
+                const char *waveform_name = nullptr;
+                ISMRMRD::WaveformType waveform_type = ISMRMRD::WaveformType::OTHER;
+                bool has_trigger_channel = false;
+            };
+
+            auto describe_xa_waveform = [](uint32_t raw_magic, bool use_xa50_layout) {
+                XaWaveformDescriptor descriptor;
+                if (use_xa50_layout) {
+                    switch (raw_magic) {
+                        case 0:
+                        case 1:
+                        case 2:
+                        case 3:
+                            descriptor.is_ecg = true;
+                            descriptor.ecg_channel = raw_magic;
+                            return descriptor;
+                        case 4:
+                            descriptor.uses_standard_header = true;
+                            descriptor.standard_type = PMU_Type::PULS;
+                            return descriptor;
+                        case 5:
+                            descriptor.uses_standard_header = true;
+                            descriptor.standard_type = PMU_Type::RESP;
+                            return descriptor;
+                        case 6:
+                            descriptor.uses_standard_header = true;
+                            descriptor.standard_type = PMU_Type::EXT1;
+                            return descriptor;
+                        case 7:
+                            descriptor.uses_standard_header = true;
+                            descriptor.standard_type = PMU_Type::EXT2;
+                            return descriptor;
+                        case 8:
+                            descriptor.waveform_name = "EVENTS";
+                            descriptor.has_trigger_channel = true;
+                            return descriptor;
+                        case 9:
+                            descriptor.waveform_name = "PTC";
+                            descriptor.has_trigger_channel = true;
+                            return descriptor;
+                        case 10:
+                            descriptor.waveform_name = "PTR";
+                            descriptor.has_trigger_channel = true;
+                            return descriptor;
+                        case 11:
+                            descriptor.waveform_name = "GRAD";
+                            descriptor.has_trigger_channel = true;
+                            return descriptor;
+                        default:
+                            return descriptor;
+                    }
+                }
+
+                switch (raw_magic) {
+                    case 1:
+                    case 2:
+                    case 3:
+                    case 4:
+                        descriptor.is_ecg = true;
+                        descriptor.ecg_channel = raw_magic - 1;
+                        return descriptor;
+                    case 5:
+                        descriptor.uses_standard_header = true;
+                        descriptor.standard_type = PMU_Type::PULS;
+                        return descriptor;
+                    case 6:
+                        descriptor.uses_standard_header = true;
+                        descriptor.standard_type = PMU_Type::RESP;
+                        return descriptor;
+                    case 7:
+                        descriptor.uses_standard_header = true;
+                        descriptor.standard_type = PMU_Type::EXT1;
+                        return descriptor;
+                    case 8:
+                        descriptor.uses_standard_header = true;
+                        descriptor.standard_type = PMU_Type::EXT2;
+                        return descriptor;
+                    default:
+                        return descriptor;
+                }
+            };
+
             if (payload.size() < sizeof(uint32_t) + 60 + 3 * sizeof(uint32_t)) {
                 return false;
             }
@@ -1682,9 +1778,13 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
                 return false;
             }
 
-            std::map<uint32_t, std::vector<uint32_t>> ecg_map;
-            std::map<uint32_t, std::vector<uint32_t>> known_map;
-            std::map<uint32_t, std::vector<uint32_t>> unknown_map;
+            struct XaRawWaveform {
+                uint32_t raw_magic;
+                std::vector<uint32_t> data;
+            };
+
+            std::vector<XaRawWaveform> raw_waveforms;
+            bool saw_xa50_only_type = false;
 
             while (offset + 2 * sizeof(uint32_t) <= payload.size()) {
                 uint32_t raw_magic, period;
@@ -1708,17 +1808,45 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
                 memcpy(data.data(), payload.data() + offset, bytes);
                 offset += bytes;
 
-                if (raw_magic >= 1 && raw_magic <= 4) {
-                    ecg_map[raw_magic] = std::move(data);
-                } else if (raw_magic >= 5 && raw_magic <= 8) {
-                    known_map[raw_magic] = std::move(data);
-                } else {
-                    unknown_map[raw_magic] = std::move(data);
+                if (raw_magic == 0 || raw_magic >= 9) {
+                    saw_xa50_only_type = true;
                 }
+
+                raw_waveforms.push_back(XaRawWaveform{raw_magic, std::move(data)});
             }
 
-            if (ecg_map.empty() && known_map.empty() && unknown_map.empty()) {
+            if (raw_waveforms.empty()) {
                 return false;
+            }
+
+            // XA50 PMU packets use a zero-based waveform numbering scheme, unlike later XA data.
+            bool use_xa50_layout = isXa50 || saw_xa50_only_type;
+            std::map<uint32_t, std::vector<uint32_t>> ecg_map;
+            std::map<PMU_Type, std::vector<uint32_t>> known_map;
+            struct XaNamedWaveform {
+                std::string waveform_name;
+                ISMRMRD::WaveformType waveform_type;
+                bool has_trigger_channel;
+                std::vector<uint32_t> data;
+            };
+            std::vector<XaNamedWaveform> named_map;
+            std::map<uint32_t, std::vector<uint32_t>> unknown_map;
+
+            for (auto &raw_waveform : raw_waveforms) {
+                auto descriptor = describe_xa_waveform(raw_waveform.raw_magic, use_xa50_layout);
+                if (descriptor.is_ecg) {
+                    ecg_map[descriptor.ecg_channel] = std::move(raw_waveform.data);
+                } else if (descriptor.uses_standard_header) {
+                    known_map[descriptor.standard_type] = std::move(raw_waveform.data);
+                } else if (descriptor.waveform_name) {
+                    named_map.push_back(XaNamedWaveform{
+                            descriptor.waveform_name,
+                            descriptor.waveform_type,
+                            descriptor.has_trigger_channel,
+                            std::move(raw_waveform.data)});
+                } else {
+                    unknown_map[raw_waveform.raw_magic] = std::move(raw_waveform.data);
+                }
             }
 
             makeWaveformHeader(header);
@@ -1742,15 +1870,30 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
 
             for (auto &key_val : known_map) {
                 auto waveform = ISMRMRD::Waveform(key_val.second.size(), 2);
-                waveform.head.waveform_id = key_val.first - 4 + 5 * learning_phase;
+                waveform.head.waveform_id = waveformId.at(key_val.first) + 5 * learning_phase;
                 std::copy(key_val.second.begin(), key_val.second.end(), waveform.data);
                 std::fill(waveform.data + key_val.second.size(), waveform.data + 2 * key_val.second.size(), 0);
                 waveforms.push_back(std::move(waveform));
             }
 
+            for (auto &key_val : named_map) {
+                auto waveform = ISMRMRD::Waveform(key_val.data.size(), key_val.has_trigger_channel ? 2 : 1);
+                auto waveform_name = key_val.waveform_name + (learning_phase ? "_Learning" : "");
+                waveform.head.waveform_id = ensureXaWaveformHeader(header, waveform_name, key_val.waveform_type,
+                                                                   key_val.has_trigger_channel);
+                std::copy(key_val.data.begin(), key_val.data.end(), waveform.data);
+                if (key_val.has_trigger_channel) {
+                    std::fill(waveform.data + key_val.data.size(), waveform.data + 2 * key_val.data.size(), 0);
+                }
+                waveforms.push_back(std::move(waveform));
+            }
+
             for (auto &key_val : unknown_map) {
                 auto waveform = ISMRMRD::Waveform(key_val.second.size(), 1);
-                waveform.head.waveform_id = ensureXaWaveformHeader(header, key_val.first);
+                auto waveform_name = std::string("PMU") + std::to_string(key_val.first)
+                        + (learning_phase ? "_Learning" : "");
+                waveform.head.waveform_id = ensureXaWaveformHeader(header, waveform_name, ISMRMRD::WaveformType::OTHER,
+                                                                   false);
                 std::copy(key_val.second.begin(), key_val.second.end(), waveform.data);
                 waveforms.push_back(std::move(waveform));
             }
@@ -1935,6 +2078,19 @@ std::string readXmlConfig(bool debug_xml, const std::string &parammap_file_conte
 
 
         std::string config_buffer = std::string(&buffers[b].buf[0], buffers[b].buf.size() - 2);
+        auto extract_inline_value = [&config_buffer](const std::string &key) {
+            auto key_pos = config_buffer.find(key);
+            if (key_pos == std::string::npos) return std::string();
+
+            auto value_start = config_buffer.find("{ \"", key_pos + key.size());
+            if (value_start == std::string::npos) return std::string();
+
+            auto quote_pos = value_start + 2;
+            auto end_quote_pos = config_buffer.find('"', quote_pos + 1);
+            if (end_quote_pos == std::string::npos) return std::string();
+
+            return config_buffer.substr(quote_pos + 1, end_quote_pos - quote_pos - 1);
+        };
         XProtocol::XNode n;
 
         if (debug_xml) {
@@ -1942,11 +2098,8 @@ std::string readXmlConfig(bool debug_xml, const std::string &parammap_file_conte
             o.write(config_buffer.c_str(), config_buffer.size());
         }
 
-        bool is_NX = false;
-        if(config_buffer.find("syngo MR XA11")!=std::string::npos)
-        {
-            is_NX = true;
-        }
+        bool is_NX = (config_buffer.find("syngo MR XA") != std::string::npos)
+                  || (config_buffer.find("NXVA") != std::string::npos);
 
         if (ParseXProtocol(config_buffer, n) < 0) {
             std::stringstream sstream;
@@ -2291,6 +2444,9 @@ std::string readXmlConfig(bool debug_xml, const std::string &parammap_file_conte
         if (baseLineString.empty()) {
             std::cerr << "Failed to find MEAS.sProtConsistencyInfo.tBaselineString/tMeasuredBaselineString"
                       << std::endl;
+            if (is_NX) {
+                baseLineString = "NXVA";
+            }
         }
 
         // Get software version
@@ -2303,6 +2459,13 @@ std::string readXmlConfig(bool debug_xml, const std::string &parammap_file_conte
             }
             if (temp.size() > 0) {
                 software_version = temp[0];
+            }
+        }
+
+        if (software_version.empty() && is_NX) {
+            software_version = extract_inline_value("SoftwareVersions");
+            if (software_version.empty()) {
+                software_version = "syngo MR XA";
             }
         }
 
