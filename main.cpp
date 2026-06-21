@@ -1765,10 +1765,14 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
             learning_phase = packedID.find("PMULearnPhase") != packedID.npos;
 
             size_t offset = sizeof(uint32_t) + 60;
-            uint32_t timestamp0, encoded_duration;
-            if (!read_u32(offset, timestamp0) || !read_u32(offset, timestamp) || !read_u32(offset, encoded_duration)) {
+            uint32_t timestamp_counter, encoded_duration;
+            if (!read_u32(offset, timestamp) || !read_u32(offset, timestamp_counter)
+                || !read_u32(offset, encoded_duration)) {
                 return false;
             }
+
+            // XA packets store the packet time stamp in the first field. The second field is a
+            // packet counter, which only increments by one and breaks concatenated duration checks.
 
             duration = encoded_duration & 0xFFFF;
             if (duration == 0) {
