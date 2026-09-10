@@ -1570,6 +1570,12 @@ std::vector<ISMRMRD::Waveform> readSyncdata(std::istream &siemens_dat, bool VBFI
             return std::vector<ISMRMRD::Waveform>();
         }
 
+        // XA Pilot Tone uses several PMUPT* sync packet types for configuration, training,
+        // history, and RF data. They are not encoded as physiological waveform packets.
+        if (packedID != "PMUData" && packedID != "PMULearnPhase") {
+            return std::vector<ISMRMRD::Waveform>();
+        }
+
         bool learning_phase = packedID.find("PMULearnPhase") != packedID.npos;
         std::vector<ISMRMRD::Waveform> waveforms;
         waveforms.reserve(5);
